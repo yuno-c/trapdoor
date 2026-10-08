@@ -1,0 +1,93 @@
+# Trapdoor v1 starter rules. Human-readable by design: anyone should be able
+# to read a rule and understand it. Loaded with stdlib tomllib (no new
+# dependency). `~` expands to $HOME at analysis time.
+#
+# Matcher types (implemented in rules.py):
+#   sensitive_read  file events touching credential/identity paths
+#   network         inet connect/bind (loopback gets loopback_severity)
+#   write_then_exec a proc.exec whose path was written earlier in the trace
+#   tool_exec       execution of download tools (possible fetch-and-execute)
+#   path_write      file modifications under persistence locations
+#   external_write  modifications outside the project directory
+#
+# Severity: info < low < medium < high. Verdicts are only clean/suspicious:
+# we do not classify malware.
+
+[[rule]]
+id = "secret-access"
+type = "sensitive_read"
+severity = "high"
+description = "Credential and identity files must not be touched by installs"
+message = "touched sensitive file {path}"
+paths = [
+  "~/.ssh/",
+  "~/.aws/",
+  "~/.npmrc",
+  "~/.config/gcloud/",
+  "~/.gnupg/",
+  "~/.mozilla/",
+  "~/.config/google-chrome/",
+  "~/.config/chromium/",
+  "~/.config/BraveSoftware/",
+  "~/.bash_history",
+  "~/.zsh_history",
+  "~/.history",
+  "~/.netrc",
+  "~/.git-credentials",
+]
+
+[[rule]]
+id = "unexpected-network"
+type = "network"
+severity = "medium"
+description = "Install-time network connections are unexpected unless they go to the package registry"
+message = "network connection to {addr}:{port}"
+loopback_severity = "low"
+
+[[rule]]
+id = "fetch-and-execute"
+type = "write_then_exec"
+severity = "high"
+description = "A file written during install was then executed"
+message = "executed file written during install: {path}"
+
+[[rule]]
+id = "download-tool"
+type = "tool_exec"
+severity = "medium"
+description = "A download tool ran during install (possible fetch-and-execute)"
+message = "download tool executed: {name}"
+tools = ["curl", "wget", "nc", "ncat", "openssl"]
+
+[[rule]]
+id = "persistence"
+type = "path_write"
+severity = "high"
+description = "Writes to shell startup, scheduler, or autostart locations"
+message = "write to persistence location {path}"
+paths = [
+  "~/.bashrc",
+  "~/.bash_profile",
+  "~/.bash_login",
+  "~/.profile",
+  "~/.zshrc",
+  "~/.zshenv",
+  "~/.zprofile",
+  "~/.config/autostart/",
+  "~/.config/systemd/user/",
+  "~/.local/share/systemd/user/",
+  "~/.crontab",
+  "/etc/cron.d/",
+  "/etc/crontab",
+]
+
+[[rule]]
+id = "write-outside-project"
+type = "external_write"
+severity = "low"
+description = "Modifications outside the project directory"
+message = "modification outside project: {path}"
+# Cache, temp, and pseudo-filesystem writes are normal build noise.
+# Note the trade-off: malware also likes /tmp, but flagging every temp
+# write would make the tool unusable. /tmp stays ignored; severity stays low.
+ignore_prefixes = ["~/.npm/", "~/.cache/", "/tmp/", "/dev/", "/proc/", "/sys/"]

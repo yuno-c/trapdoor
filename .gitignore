@@ -1,0 +1,10 @@
+.direnv/
+.build/
+build/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+*.egg-info/
+result
+DECISIONS.md
