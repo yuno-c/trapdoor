@@ -147,7 +147,7 @@ in scripts.
 | Platform | Status |
 |---|---|
 | Linux x86-64 | Supported. Tested in CI on Ubuntu. |
-| Windows | Expected to work inside WSL2 (real Linux kernel); not yet tested. |
+| Windows | Works inside WSL2 (Ubuntu): builds and passes the full test suite. Native Windows is not supported. |
 | macOS | Not supported. Use a Linux VM or CI. |
 | Linux aarch64 | Planned. |
 
