@@ -382,3 +382,288 @@ def test_external_write_under_fakehome_not_swallowed_by_tmp_exemption():
     assert "write-outside-project" not in rule_ids_scratch
 
 
+def test_dns_port_53_nameserver_exemption_and_rogue_flagging(tmp_path):
+    """Hermetic test: port 53 exempt only for authorized nameservers.
+
+    Uses synthetic events and injected nameservers list (never reads /etc/resolv.conf).
+    """
+    from trapdoor.events import Event
+    from trapdoor.rules import evaluate, get_system_nameservers, load_rules
+
+    rules = load_rules()
+    injected_nameservers = {"192.0.2.53", "127.0.0.53"}
+
+    # 1. Connect to authorized nameserver on port 53 -> exempt (no hit)
+    ev_allowed_ns = [
+        Event(t=0.1, pid=1, ppid=0, exe="/bin/curl", kind="net.connect",
+              fields={"addr": "192.0.2.53", "port": 53, "family": "inet"}),
+        Event(t=0.2, pid=1, ppid=0, exe="/bin/curl", kind="net.connect",
+              fields={"addr": "127.0.0.53", "port": 53, "family": "inet"}),
+    ]
+    hits = evaluate(ev_allowed_ns, rules, project=str(tmp_path),
+                    nameservers=injected_nameservers)
+    assert hits == []
+
+    # 2. Connect to unauthorized port 53 destination -> flagged
+    ev_rogue_external = [
+        Event(t=0.3, pid=1, ppid=0, exe="/bin/curl", kind="net.connect",
+              fields={"addr": "8.8.8.8", "port": 53, "family": "inet"}),
+    ]
+    hits_rogue = evaluate(ev_rogue_external, rules, project=str(tmp_path),
+                          nameservers=injected_nameservers)
+    assert len(hits_rogue) == 1
+    assert hits_rogue[0].rule_id == "unexpected-network"
+    assert hits_rogue[0].severity == "medium"
+    assert "8.8.8.8:53" in hits_rogue[0].message
+
+    # 3. Connect to loopback port 53 that is not in nameservers -> flagged with low severity
+    ev_rogue_loopback = [
+        Event(t=0.4, pid=1, ppid=0, exe="/bin/curl", kind="net.connect",
+              fields={"addr": "127.0.0.1", "port": 53, "family": "inet"}),
+    ]
+    hits_loopback = evaluate(ev_rogue_loopback, rules, project=str(tmp_path),
+                             nameservers=injected_nameservers)
+    assert len(hits_loopback) == 1
+    assert hits_loopback[0].rule_id == "unexpected-network"
+    assert hits_loopback[0].severity == "low"
+
+    # 4. Connect to nameserver on non-DNS port (e.g. 80) -> flagged with medium severity
+    ev_ns_non_dns_port = [
+        Event(t=0.5, pid=1, ppid=0, exe="/bin/curl", kind="net.connect",
+              fields={"addr": "192.0.2.53", "port": 80, "family": "inet"}),
+    ]
+    hits_non_dns = evaluate(ev_ns_non_dns_port, rules, project=str(tmp_path),
+                            nameservers=injected_nameservers)
+    assert len(hits_non_dns) == 1
+    assert hits_non_dns[0].rule_id == "unexpected-network"
+    assert hits_non_dns[0].severity == "medium"
+
+    # 5. Verify get_system_nameservers parser logic with custom file
+    fake_resolv = tmp_path / "resolv.conf"
+    fake_resolv.write_text(
+        "# Comment\n"
+        "; Another comment\n"
+        "nameserver 10.0.0.1\n"
+        "search example.com\n"
+        "nameserver 10.0.0.2\n"
+    )
+    parsed = get_system_nameservers(fake_resolv)
+    assert parsed == {"127.0.0.53", "10.0.0.1", "10.0.0.2"}
+
+    # Missing file safely falls back to 127.0.0.53
+    assert get_system_nameservers(tmp_path / "nonexistent") == {"127.0.0.53"}
+
+
+def test_net_bind_loopback_exempt_and_external_flagged(tmp_path):
+    """Hermetic test: net.bind to loopback is exempt; non-loopback bind flags.
+
+    Loopback net.connect stays low severity so beacon fixture passes.
+    """
+    from trapdoor.events import Event
+    from trapdoor.rules import evaluate, load_rules
+
+    rules = load_rules()
+
+    # 1. net.bind to loopback -> exempt (no hit)
+    ev_bind_loopback = [
+        Event(t=0.1, pid=1, ppid=0, exe="/bin/python", kind="net.bind",
+              fields={"addr": "127.0.0.1", "port": 8000, "family": "inet"}),
+        Event(t=0.2, pid=1, ppid=0, exe="/bin/python", kind="net.bind",
+              fields={"addr": "::1", "port": 8000, "family": "inet6"}),
+    ]
+    hits = evaluate(ev_bind_loopback, rules, project=str(tmp_path))
+    assert hits == []
+
+    # 2. net.bind to non-loopback address -> flags medium severity
+    ev_bind_external = [
+        Event(t=0.3, pid=1, ppid=0, exe="/bin/python", kind="net.bind",
+              fields={"addr": "0.0.0.0", "port": 8000, "family": "inet"}),
+        Event(t=0.4, pid=1, ppid=0, exe="/bin/python", kind="net.bind",
+              fields={"addr": "192.168.1.100", "port": 8000, "family": "inet"}),
+    ]
+    hits_bind_ext = evaluate(ev_bind_external, rules, project=str(tmp_path))
+    assert len(hits_bind_ext) == 2
+    for h in hits_bind_ext:
+        assert h.rule_id == "unexpected-network"
+        assert h.severity == "medium"
+
+    # 3. net.connect to loopback stays low severity
+    ev_connect_loopback = [
+        Event(t=0.5, pid=1, ppid=0, exe="/bin/python", kind="net.connect",
+              fields={"addr": "127.0.0.1", "port": 9999, "family": "inet"}),
+    ]
+    hits_connect = evaluate(ev_connect_loopback, rules, project=str(tmp_path))
+    assert len(hits_connect) == 1
+    assert hits_connect[0].rule_id == "unexpected-network"
+    assert hits_connect[0].severity == "low"
+
+
+def test_tiered_verdict_clean_notices_suspicious(tmp_path):
+    """Hermetic test: tiered verdict (clean, notices, suspicious).
+
+    - 0 hits: 'no suspicious behavior' (text) / 'clean' (JSON)
+    - low-only: 'notices' (text) / 'notices' (JSON)
+    - medium or higher: 'SUSPICIOUS' (text) / 'suspicious' (JSON)
+    """
+    from trapdoor.analyze import Hit, normalize
+    from trapdoor.report import compute_verdict, render_json, render_text
+
+    analysis = normalize([], str(tmp_path))
+
+    # Case A: 0 hits -> clean
+    v_text, v_json = compute_verdict([])
+    assert v_text == "no suspicious behavior"
+    assert v_json == "clean"
+    text = render_text(analysis, [])
+    assert "verdict: no suspicious behavior" in text
+    assert render_json(analysis, [])["verdict"] == "clean"
+
+    # Case B: low-only hits -> notices
+    low_hits = [
+        Hit(rule_id="write-outside-project", severity="low",
+            message="modification outside project: /tmp/scratch",
+            exe="/bin/test", pid=123),
+    ]
+    v_text, v_json = compute_verdict(low_hits)
+    assert v_text == "notices"
+    assert v_json == "notices"
+    text = render_text(analysis, low_hits)
+    assert "verdict: notices" in text
+    assert "SUSPICIOUS" not in text
+    assert render_json(analysis, low_hits)["verdict"] == "notices"
+
+    # Case C: medium-only hit -> suspicious
+    med_hits = [
+        Hit(rule_id="unexpected-network", severity="medium",
+            message="network connection to 8.8.8.8:53",
+            exe="/bin/curl", pid=123),
+    ]
+    v_text, v_json = compute_verdict(med_hits)
+    assert v_text == "SUSPICIOUS"
+    assert v_json == "suspicious"
+    text = render_text(analysis, med_hits)
+    assert "verdict: SUSPICIOUS" in text
+    assert render_json(analysis, med_hits)["verdict"] == "suspicious"
+
+    # Case D: high-only hit -> suspicious
+    high_hits = [
+        Hit(rule_id="secret-access", severity="high",
+            message="touched sensitive file ~/.ssh/id_rsa",
+            exe="/bin/cat", pid=123),
+    ]
+    v_text, v_json = compute_verdict(high_hits)
+    assert v_text == "SUSPICIOUS"
+    assert v_json == "suspicious"
+
+    # Case E: mixed low + medium -> suspicious
+    mixed_hits = [low_hits[0], med_hits[0]]
+    v_text, v_json = compute_verdict(mixed_hits)
+    assert v_text == "SUSPICIOUS"
+    assert v_json == "suspicious"
+
+
+def test_pip_notable_files_noise_collapse(tmp_path, monkeypatch):
+    """Hermetic test: collapse .venv/, site-packages/, __pycache__/, ~/.cache/, and /tmp/pip-*.
+
+    Notable files must aggregate event counts under collapsed categories without
+    enumerating individual files. Rules must still evaluate raw events.
+    """
+    from trapdoor.analyze import collapsed_category, normalize
+    from trapdoor.events import Event
+    from trapdoor.report import render_json, render_text
+    from trapdoor.rules import evaluate, load_rules
+
+    project_dir = str(tmp_path / "myproject")
+    fake_home = str(tmp_path / "fakehome")
+    monkeypatch.setenv("HOME", fake_home)
+
+    # 1. Direct classification test
+    assert collapsed_category(f"{project_dir}/.venv/bin/activate", project_dir) == ".venv/"
+    assert collapsed_category(f"{project_dir}/.venv/lib/python3.13/site-packages/rich/syntax.py", project_dir) == "site-packages/"
+    assert collapsed_category(f"{project_dir}/site-packages/rich/syntax.py", project_dir) == "site-packages/"
+    assert collapsed_category(f"{project_dir}/__pycache__/foo.cpython-313.pyc", project_dir) == "__pycache__/"
+    assert collapsed_category(f"{fake_home}/.cache/pip/wheels/pkg.whl", project_dir) == "~/.cache/"
+    assert collapsed_category("/tmp/pip-install-12345/rich/setup.py", project_dir) == "/tmp/pip-*"
+    assert collapsed_category("/tmp/pip-build-env-xyz/overlay", project_dir) == "/tmp/pip-*"
+    assert collapsed_category(f"{project_dir}/src/app.py", project_dir) is None
+    assert collapsed_category(f"{fake_home}/.ssh/id_rsa", project_dir) is None
+
+    # 2. Normalization aggregation test
+    synthetic_events = [
+        # 3 events in .venv/
+        Event(t=0.1, pid=1, ppid=0, exe="/bin/pip", kind="file.open",
+              fields={"path": f"{project_dir}/.venv/bin/python"}),
+        Event(t=0.2, pid=1, ppid=0, exe="/bin/pip", kind="file.open",
+              fields={"path": f"{project_dir}/.venv/bin/pip"}),
+        Event(t=0.3, pid=1, ppid=0, exe="/bin/pip", kind="file.write",
+              fields={"path": f"{project_dir}/.venv/pyvenv.cfg"}),
+        # 4 events in site-packages/
+        Event(t=0.4, pid=1, ppid=0, exe="/bin/pip", kind="file.open",
+              fields={"path": f"{project_dir}/.venv/lib/python3.13/site-packages/rich/__init__.py"}),
+        Event(t=0.5, pid=1, ppid=0, exe="/bin/pip", kind="file.write",
+              fields={"path": f"{project_dir}/.venv/lib/python3.13/site-packages/rich/console.py"}),
+        Event(t=0.6, pid=1, ppid=0, exe="/bin/pip", kind="file.open",
+              fields={"path": f"{project_dir}/site-packages/extra.py"}),
+        Event(t=0.7, pid=1, ppid=0, exe="/bin/pip", kind="file.write",
+              fields={"path": f"{project_dir}/site-packages/extra2.py"}),
+        # 2 events in __pycache__/
+        Event(t=0.8, pid=1, ppid=0, exe="/bin/python", kind="file.write",
+              fields={"path": f"{project_dir}/__pycache__/mod.cpython-313.pyc"}),
+        Event(t=0.9, pid=1, ppid=0, exe="/bin/python", kind="file.open",
+              fields={"path": f"{project_dir}/.venv/lib/python3.13/site-packages/rich/__pycache__/console.cpython-313.pyc"}),
+        # 2 events in ~/.cache/
+        Event(t=1.0, pid=1, ppid=0, exe="/bin/pip", kind="file.open",
+              fields={"path": f"{fake_home}/.cache/pip/wheels/a.whl"}),
+        Event(t=1.1, pid=1, ppid=0, exe="/bin/pip", kind="file.write",
+              fields={"path": f"{fake_home}/.cache/pip/http/cache.json"}),
+        # 3 events in /tmp/pip-*
+        Event(t=1.2, pid=1, ppid=0, exe="/bin/pip", kind="file.open",
+              fields={"path": "/tmp/pip-install-abcd/setup.py"}),
+        Event(t=1.3, pid=1, ppid=0, exe="/bin/pip", kind="file.write",
+              fields={"path": "/tmp/pip-build-env-123/record.txt"}),
+        Event(t=1.4, pid=1, ppid=0, exe="/bin/pip", kind="file.delete",
+              fields={"path": "/tmp/pip-unpack-999/tmp.whl"}),
+        # 1 uncollapsed notable file
+        Event(t=1.5, pid=1, ppid=0, exe="/bin/pip", kind="file.open",
+              fields={"path": f"{fake_home}/.ssh/id_rsa"}),
+    ]
+
+    analysis = normalize(synthetic_events, project_dir)
+
+    # Notable files must have collapsed categories with exact counts
+    assert analysis.notable_files[".venv/"] == 3
+    assert analysis.notable_files["site-packages/"] == 4
+    assert analysis.notable_files["__pycache__/"] == 2
+    assert analysis.notable_files["~/.cache/"] == 2
+    assert analysis.notable_files["/tmp/pip-*"] == 3
+    assert analysis.notable_files[f"{fake_home}/.ssh/id_rsa"] == 1
+
+    # Individual subfiles must NOT be keys in notable_files
+    assert f"{project_dir}/.venv/bin/python" not in analysis.notable_files
+    assert "/tmp/pip-install-abcd/setup.py" not in analysis.notable_files
+    assert f"{fake_home}/.cache/pip/wheels/a.whl" not in analysis.notable_files
+
+    # 3. Report rendering test
+    text = render_text(analysis, [])
+    assert ".venv/  (3 events)" in text
+    assert "site-packages/  (4 events)" in text
+    assert "__pycache__/  (2 events)" in text
+    assert "~/.cache/  (2 events)" in text
+    assert "/tmp/pip-*  (3 events)" in text
+
+    data = render_json(analysis, [])
+    assert data["notable_files"][".venv/"] == 3
+    assert data["notable_files"]["site-packages/"] == 4
+    assert data["notable_files"]["__pycache__/"] == 2
+    assert data["notable_files"]["~/.cache/"] == 2
+    assert data["notable_files"]["/tmp/pip-*"] == 3
+
+    # 4. Rules still evaluate raw events (uncollapsed raw paths)
+    rules = load_rules()
+    hits = evaluate(synthetic_events, rules, project=project_dir, home=fake_home)
+    # The event touching ~/.ssh/id_rsa must still be flagged by secret-access
+    hit_ids = {h.rule_id for h in hits}
+    assert "secret-access" in hit_ids
+
+
+

@@ -22,12 +22,31 @@ def _plural(n: int, singular: str) -> str:
     return f"{n} {singular}" + ("" if n == 1 else "s")
 
 
+SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3}
+
+
+def compute_verdict(hits: list[Hit]) -> tuple[str, str]:
+    """Compute tiered verdict for report rendering.
+
+    Returns (text_verdict, json_verdict).
+    - SUSPICIOUS / "suspicious" only for medium or higher (rank >= 2)
+    - notices / "notices" when hits are low or info only (rank < 2)
+    - no suspicious behavior / "clean" when there are zero hits
+    """
+    if not hits:
+        return "no suspicious behavior", "clean"
+    if any(SEVERITY_RANK.get(h.severity, 0) >= 2 for h in hits):
+        return "SUSPICIOUS", "suspicious"
+    return "notices", "notices"
+
+
 def render_text(analysis: Analysis, hits: list[Hit]) -> str:
     lines: list[str] = []
     lines.append("trapdoor report")
     lines.append("===============")
     lines.append("")
-    lines.append(f"verdict: {'SUSPICIOUS' if hits else 'no suspicious behavior'}")
+    v_text, _ = compute_verdict(hits)
+    lines.append(f"verdict: {v_text}")
     lines.append("")
 
     if analysis.warnings:
@@ -85,8 +104,9 @@ def render_text(analysis: Analysis, hits: list[Hit]) -> str:
 
 
 def render_json(analysis: Analysis, hits: list[Hit]) -> dict:
+    _, v_json = compute_verdict(hits)
     return {
-        "verdict": "suspicious" if hits else "clean",
+        "verdict": v_json,
         "project": analysis.project,
         "warnings": analysis.warnings,
         "network": [

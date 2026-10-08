@@ -55,7 +55,8 @@ def _has_external_network(events: list) -> bool:
 
 def cmd_run(argv: list[str], *, output: str | None, as_json: bool,
             keep_events: bool, allow_ips: list[str] | None = None,
-            allowed_ips: set[str] | None = None) -> int:
+            allowed_ips: set[str] | None = None,
+            nameservers: set[str] | None = None) -> int:
     tracer = find_tracer()
     if tracer is None:
         print("error: trapdoor-trace binary not found. Build it: "
@@ -138,7 +139,8 @@ def cmd_run(argv: list[str], *, output: str | None, as_json: bool,
     except (FileNotFoundError, ValueError) as e:
         print(f"error: rules invalid: {e}", file=sys.stderr)
         return 2
-    hits = evaluate(events, rules, project, allowed_ips=effective_allowed)
+    hits = evaluate(events, rules, project, allowed_ips=effective_allowed,
+                    nameservers=nameservers)
     analysis.hits = hits
 
     if as_json:

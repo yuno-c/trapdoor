@@ -74,7 +74,81 @@ class Analysis:
     warnings: list[str] = field(default_factory=list)
 
 
+COLLAPSED_CATEGORIES = (
+    ".venv/",
+    "site-packages/",
+    "__pycache__/",
+    "~/.cache/",
+    "/tmp/pip-*",
+)
+
+
+def collapsed_category(path: str, project: str) -> str | None:
+    """Classify known noise paths from package installations into collapse categories."""
+    if not path:
+        return None
+
+    # /tmp/pip-*
+    if path == "/tmp/pip-*" or path.startswith("/tmp/pip-"):
+        return "/tmp/pip-*"
+
+    # ~/.cache/
+    if path == "~/.cache" or path.startswith("~/.cache/"):
+        return "~/.cache/"
+    home = os.environ.get("HOME")
+    if home:
+        home_norm = home.rstrip("/")
+        if path == f"{home_norm}/.cache" or path.startswith(f"{home_norm}/.cache/"):
+            return "~/.cache/"
+    try:
+        user_home = str(Path.home()).rstrip("/")
+        if path == f"{user_home}/.cache" or path.startswith(f"{user_home}/.cache/"):
+            return "~/.cache/"
+    except Exception:
+        pass
+
+    # __pycache__/
+    if (
+        "/__pycache__/" in path
+        or path.endswith("/__pycache__")
+        or path.startswith("__pycache__/")
+        or path == "__pycache__"
+        or path.startswith("./__pycache__/")
+    ):
+        return "__pycache__/"
+
+    # site-packages/
+    if (
+        "/site-packages/" in path
+        or path.endswith("/site-packages")
+        or path.startswith("site-packages/")
+        or path == "site-packages"
+        or path.startswith("./site-packages/")
+    ):
+        return "site-packages/"
+
+    # .venv/
+    if (
+        "/.venv/" in path
+        or path.endswith("/.venv")
+        or path.startswith(".venv/")
+        or path == ".venv"
+        or path.startswith("./.venv/")
+    ):
+        return ".venv/"
+    try:
+        rel = str(Path(path).relative_to(Path(project)))
+        if rel == ".venv" or rel.startswith(".venv/"):
+            return ".venv/"
+    except ValueError:
+        pass
+
+    return None
+
+
 def _display(path: str, project: str) -> str:
+    if path in COLLAPSED_CATEGORIES:
+        return path
     try:
         p = Path(path)
         rel = p.relative_to(Path(project))
@@ -167,7 +241,11 @@ def normalize(events: list[Event], project: str) -> Analysis:
             if area is not None:
                 noise_files[area] += 1
             else:
-                notable[path] += 1
+                cat = collapsed_category(path, project)
+                if cat is not None:
+                    notable[cat] += 1
+                elif path:
+                    notable[path] += 1
             if e.kind == "file.write":
                 written_paths.add(path)
             elif e.kind == "file.open":
@@ -178,8 +256,12 @@ def normalize(events: list[Event], project: str) -> Analysis:
                     written_paths.add(path)
         elif e.kind in ("file.delete", "file.rename"):
             path = str(e.get("path", e.get("src", "")))
-            if noise_label(path, project) is None:
-                notable[path] += 1
+            if path and noise_label(path, project) is None:
+                cat = collapsed_category(path, project)
+                if cat is not None:
+                    notable[cat] += 1
+                else:
+                    notable[path] += 1
         elif e.kind in ("net.connect", "net.bind"):
             fam = str(e.get("family", "?"))
             if fam in ("inet", "inet6"):

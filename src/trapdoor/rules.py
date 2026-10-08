@@ -90,6 +90,24 @@ def resolve_allowed_hosts(timeout: float = 2.0) -> tuple[set[str], list[str]]:
     return resolved, failed
 
 
+def get_system_nameservers(resolv_conf: str | Path = "/etc/resolv.conf") -> set[str]:
+    """Parse nameserver IP addresses from resolv.conf. Always includes 127.0.0.53."""
+    nameservers = {"127.0.0.53"}
+    p = Path(resolv_conf)
+    if p.is_file():
+        try:
+            for line in p.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith(";"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    nameservers.add(parts[1])
+        except OSError:
+            pass
+    return nameservers
+
+
 def find_rules_file() -> Path:
     here = Path(__file__).resolve().parent
     candidate = here / "rules.toml"
@@ -161,7 +179,8 @@ def _write_event(e: Event) -> bool:
 
 def evaluate(events: list[Event], rules: list[dict], project: str,
              allowed_ips: set[str] | None = None,
-             home: str | None = None) -> list[Hit]:
+             home: str | None = None,
+             nameservers: set[str] | None = None) -> list[Hit]:
     hits: list[Hit] = []
     written: list[tuple[Event, str]] = []
     for e in events:
@@ -185,17 +204,35 @@ def evaluate(events: list[Event], rules: list[dict], project: str,
                         exe=e.exe, pid=e.pid, sample=e))
 
         elif rtype == "network":
+            effective_nameservers = (
+                get_system_nameservers() if nameservers is None else nameservers
+            )
             for e in events:
                 if e.kind not in ("net.connect", "net.bind"):
                     continue
                 if str(e.get("family", "")) not in ("inet", "inet6"):
                     continue
                 addr = str(e.get("addr", "?"))
-                port = e.get("port", 0)
+                try:
+                    port = int(e.get("port", 0))
+                except (ValueError, TypeError):
+                    port = 0
+
+                # Connections to port 53 are exempt ONLY when destination is a system nameserver.
+                if port == 53 and addr in effective_nameservers:
+                    continue
+
                 # Traffic to known registry IPs is expected install behavior (no hit).
                 if allowed_ips is not None and addr in allowed_ips:
                     continue
-                if addr.startswith("127.") or addr in ("::1", "localhost"):
+
+                is_loopback = addr.startswith("127.") or addr in ("::1", "localhost")
+
+                # Don't flag net.bind to loopback; keep flagging binds to non-loopback addresses.
+                if e.kind == "net.bind" and is_loopback:
+                    continue
+
+                if is_loopback:
                     sev = rule.get("loopback_severity", "low")
                 else:
                     sev = rule["severity"]
