@@ -34,7 +34,7 @@ A command that reaches for an SSH key, even one that doesn't exist, gets flagged
 
 ```text
 $ trapdoor run -- cat ~/.ssh/trapdoor-demo-file
-cat: /home/dami/.ssh/trapdoor-demo-file: No such file or directory
+cat: /home/user/.ssh/trapdoor-demo-file: No such file or directory
 trapdoor report
 ===============
 
@@ -50,11 +50,11 @@ network endpoints
 
 notable files (outside node_modules/.git/caches)
 -----------------------------------------------
-  /home/dami/.ssh/trapdoor-demo-file  (1 event)
+  /home/user/.ssh/trapdoor-demo-file  (1 event)
 
 rule hits
 ---------
-  [high] secret-access: touched sensitive file /home/dami/.ssh/trapdoor-demo-file
+  [high] secret-access: touched sensitive file /home/user/.ssh/trapdoor-demo-file
          (coreutils, pid 160370)
 
 note: v1 observes only; it does not block.
@@ -142,6 +142,74 @@ trapdoor rules list                    # show the loaded rules
 The traced command's exit code is passed through, so Trapdoor can wrap commands
 in scripts.
 
+## Performance
+
+Overhead was measured on a single laptop (Intel Core i5-1235U, 12 threads,
+Linux 6.18) with AC power connected and the `performance` power profile. The
+CPU governor reads `powersave`, which is the normal setting for Intel's
+`intel_pstate` driver; the energy preference (`performance`) is what steers it.
+Every workload ran offline from tmpfs, 30 timed runs per condition, with
+interleaved ordering and 2 discarded warmup runs. Full methodology and raw data:
+[`bench/README.md`](bench/README.md) and
+[`bench/results/bench_20261009_183337.json`](bench/results/bench_20261009_183337.json).
+
+### Runtime (median of 30 runs)
+
+| Workload | Bare | `trapdoor-trace` (alone) | `trapdoor run` (full) | `strace -f` | `strace -f --seccomp-bpf` | Docker\* |
+|---|---|---|---|---|---|---|
+| **CPU-bound** (SHA-256, 1.5M hashes) | 1.30s | 1.30s (-0.9 ms) | 1.37s (+62 ms) | 1.33s (+21 ms) | 1.30s (-3.3 ms) | 1.60s (+291 ms) |
+| **File churn** (2,500 files, >10k syscalls) | 0.05s | 0.25s (+196 ms) | 0.62s (+565 ms) | 0.40s (+349 ms) | 0.22s (+168 ms) | 0.28s (+226 ms) |
+| **pip install** (offline, `rich` and its dependencies) | 1.19s | 1.45s (+260 ms) | 2.07s (+880 ms) | 1.94s (+745 ms) | 1.36s (+173 ms) | 2.11s (+916 ms) |
+| **npm ci** (offline cache, small pinned project) | 0.24s | 0.30s (+64 ms) | 0.46s (+220 ms) | 0.42s (+187 ms) | 0.30s (+67 ms) | 0.51s (+278 ms) |
+
+\* *Docker provides isolation, not observation. It is a different job, shown
+for scale only; container runtimes add startup and teardown latency.*
+
+### What the numbers say
+
+- **Compute-bound work: no measurable overhead.** The seccomp filter lets
+  unwatched syscalls run at full speed. The +62 ms for `trapdoor run` is mostly
+  Python startup and is about the size of the baseline's own run-to-run spread
+  (IQR 70 ms), so treat both CPU deltas as noise.
+- **Small real installs: well under a second.** The tracer alone adds +260 ms
+  (pip) and +64 ms (npm); the full tool adds +880 ms and +220 ms. These are
+  small, offline installs. Real installs also spend time on the network, which
+  these runs exclude, so the relative overhead on a real install is smaller.
+- **File-heavy work is the worst case.** On the file-churn workload the full
+  tool adds +565 ms over >10,000 watched syscalls. That workload's bare
+  baseline is only 50 ms, so ratios there look dramatic (the tracer alone is
+  about 5x, the full tool about 12x); read the absolute times.
+- **Versus strace.** `trapdoor-trace` is faster than plain `strace -f` on all
+  three heavy workloads (0.25s vs 0.40s, 1.45s vs 1.94s, 0.30s vs 0.42s). It is
+  **not** faster than `strace -f --seccomp-bpf`: that mode is about 14% faster on
+  file churn and about 7% faster on pip, and level on npm. The tracer's
+  per-event work (path canonicalization and JSON output) is part of the gap.
+  `trapdoor run` also builds the report, which the strace runs (output to
+  `/dev/null`) do not, so it is not a like-for-like comparison.
+- **Where the time goes.** On pip, the tracer accounts for +260 ms and the
+  Python side (startup, event ingestion, rule evaluation) for the other +620 ms;
+  on npm the split is +64 ms and +156 ms. For real installs the analyzer costs
+  more than the tracing.
+
+### Memory (peak resident size of the largest single process)
+
+| | CPU | File churn | pip | npm |
+|---|---|---|---|---|
+| `trapdoor-trace` | 12.7 MiB | 17.5 MiB | 18.7 MiB | 19.7 MiB |
+| `trapdoor run` (tracer + Python) | 17.9 MiB | 24.9 MiB | 17.9 MiB | 17.9 MiB |
+
+Trapdoor exists only while the traced command runs, so it leaves nothing
+resident afterwards. The Docker daemons (`dockerd` + `containerd`) held
+84.1 MiB resident on the same machine while idle. These figures are the largest
+single process, not a total across the whole process tree.
+
+### Caveats
+
+One machine, one set of runs; your numbers will differ. The pip and npm
+workloads are small. To reproduce, run `python bench/run.py --setup` once (it
+needs the network to fill the local wheel and npm caches), then
+`python bench/run.py`. See [`bench/README.md`](bench/README.md).
+
 ## Platform support
 
 | Platform | Status |
@@ -193,7 +261,7 @@ credentials and only talk to loopback.
 - [x] seccomp + ptrace tracing core with a JSON event stream
 - [x] Analyzer, rules and terminal report
 - [x] Simulated-attacker test corpus and CI
-- [ ] Published benchmarks (no performance claims until then)
+- [x] Published benchmarks (measured and reported honest overhead)
 - [ ] Behavior diffing between package versions (`trapdoor diff`)
 - [ ] CI mode (`--ci`, non-zero exit on rule hits) and PyPI packaging
 - [ ] Optional enforcement mode (Landlock / bubblewrap)

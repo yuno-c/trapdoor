@@ -38,7 +38,11 @@ def find_tracer() -> Path | None:
 
 
 def _run_trace(tracer: Path, events_path: Path, argv: list[str]) -> int:
-    proc = subprocess.run([str(tracer), "-o", str(events_path), "--", *argv])
+    tracer_args = [str(tracer)]
+    if os.environ.get("TRAPDOOR_TRACE_STATS"):
+        tracer_args.append("--stats")
+    tracer_args.extend(["-o", str(events_path), "--", *argv])
+    proc = subprocess.run(tracer_args)
     return proc.returncode
 
 

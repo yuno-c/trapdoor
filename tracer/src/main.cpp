@@ -13,6 +13,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
@@ -57,9 +58,10 @@ constexpr long kTraceOptions = PTRACE_O_TRACESECCOMP | PTRACE_O_TRACEFORK |
 
 void usage(const char* prog) {
     std::fprintf(stderr,
-                 "usage: %s [-o EVENTS.jsonl] -- <command> [args...]\n"
+                 "usage: %s [-o EVENTS.jsonl] [--stats] -- <command> [args...]\n"
                  "  Events go to stdout by default. Use -o so the tracee's\n"
-                 "  own stdout cannot interleave with the event stream.\n",
+                 "  own stdout cannot interleave with the event stream.\n"
+                 "  --stats emits tracer peak RSS to stderr at exit.\n",
                  prog);
 }
 
@@ -501,6 +503,7 @@ struct Tracer {
 
 int main(int argc, char* argv[]) {
     const char* out_path = nullptr;
+    bool show_stats = false;
     int cmd_at = 1;
     // Optional tracer flags come before the "--" separator.
     while (cmd_at < argc && argv[cmd_at][0] == '-' && argv[cmd_at][1] != '\0' &&
@@ -508,6 +511,9 @@ int main(int argc, char* argv[]) {
         if (std::strcmp(argv[cmd_at], "-o") == 0 && cmd_at + 1 < argc) {
             out_path = argv[cmd_at + 1];
             cmd_at += 2;
+        } else if (std::strcmp(argv[cmd_at], "--stats") == 0) {
+            show_stats = true;
+            cmd_at += 1;
         } else {
             usage(argv[0]);
             return 2;
@@ -588,5 +594,13 @@ int main(int argc, char* argv[]) {
     }
 
     Tracer t;
-    return t.run(child);
+    int rc = t.run(child);
+    if (show_stats) {
+        struct rusage u;
+        if (getrusage(RUSAGE_SELF, &u) == 0) {
+            std::fprintf(stderr, "trapdoor-trace-stats: peak_rss_kb=%ld\n",
+                         static_cast<long>(u.ru_maxrss));
+        }
+    }
+    return rc;
 }

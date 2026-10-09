@@ -8,3 +8,5 @@ dist/
 *.egg-info/
 result
 DECISIONS.md
+bench/.cache/
+bench/scratch/
